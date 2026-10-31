@@ -1,0 +1,20 @@
+* [33ma9d8c44d[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m 修复微信备用工作区提示与回合诊断日志 (#2814)
+* [33m20d65fce[m fix(overlay): 受 transform 影响的壁纸表面改按视口换算，修复侧栏打开时错位（#2813）
+* [33mbe6162af[m 完善 Skill 分组排序与空分组显示 (#2812)
+* [33mb1eefaa4[m feat(weixin): 显式授权回传工作区附件并保护发送边界 (#2806)
+* [33mdc6cc3ee[m 修复 Skill 仓库子树符号链接校验范围 (#2811)
+* [33m03b8c543[m 修复 Windows 多开进程的安全停止边界 (#2735)
+* [33ma9a0deef[m fix(update): macOS 自动更新后「应用程序」里不再留下 .codex-plus-update.lock：更新 helper 结束时（成功或失败）持锁删掉锁文件，启动清理拿到锁时也收掉以前留下的；只删和手里这把锁是同一个文件的普通文件，被占用、被换掉或是符号链接时不动（#2774）
+* [33mc4a9b2c7[m feat(gateway): 从上游 /models 的元数据同步上下文窗口和思考等级 (#2807)
+* [33m27caea72[m feat(agent-pet): 找回旧版「大肥鱼」鲸鱼挂件，作为 Agent 桌宠的一种类型可选 (#2808)
+* [33m7c516eca[m fix(inject): 旧版 Codex 上用量状态栏仍不显示：部分旧版已有 data-codex-composer-root 却没有新版卡片标记，被误判成新版而不走兜底；改为只认 data-composer-surface-variant，并在根节点包着输入框时挂在根上（#2753）。模型选择器认不出菜单时记一次结构诊断（只记标记数量，不记模型名），为旧版分组适配取证
+* [33m5bbe05f4[m feat(weixin): 接收图片和文件并安全管理收件目录 (#2805)
+* [33ma2964d17[m feat(native-fast): Fast 补丁按内容找目标块、门控多策略兜底并在设置页自检： - 按名字找不到或结构不符时，从入口起两层内按 readServiceTier / submissionOptions / serviceTierAccess 找目标块（有读取上限、找到即停），入口改按完成标记认，换名、拆分入口都能打上补丁； - 四个门控先试已核对的严格结构，一处没命中时退到只锚定核心片段的结构，仍要求恰好命中一处、四个全中；queue-default 要求 Copilot 提前返回仍在，queue-explicit 的 Copilot 判定兼容新旧两代写法，认不出时按选了 Copilot 处理； - 补丁准备失败时把原因码写进页面，Codex 设置页「原生 Fast 强制解锁」下显示已生效或暂未适配及原因； - 新增 scripts/check-native-fast.cjs，直接读本机 Codex 的 app.asar 检查能否打上补丁； - 插件市场刷新缓存优先用全局 queryClient，同步 manifest 行数
+* [33m13ee5101[m fix(plugin-market): 装完插件后原生插件列表不刷新：新版 Codex 不再暴露全局 queryClient，刷新缓存改为从 React 树里找到 QueryClient 并按 plugins 前缀失效，找不到时记一次诊断
+* [33m1949f93e[m chore(inject): 补上完整市场提示改动后重新组装的注入产物
+* [33m1509f3df[m feat(plugin-market): 完整市场仓库已公开，和公开市场一样匿名拉取，不再需要 gh 登录；raw.githubusercontent.com 连不上时改走 api.github.com 的 contents 接口取索引（#2804）；界面不再提示需要 GitHub 私有仓库权限，完整库的显示名改按来源判断
+* [33mfd11f41b[m test(core): 设置与状态单元测试的临时目录改用 tempfile 随机命名：原来按「进程号 + 计数器」命名且不删除，进程号复用后会读到上次留下的 settings.json，一轮里九个设置用例一起报 settings_revision_conflict
+* [33mc936ef31[m chore(sync): #2787 新增注释改为中文
+* [33m0739d66d[m fix(sync): 保留分页历史目录并修复旧库副本冲突 (#2787)
+* [33mf59307c0[m 修复启动器测试影响正式实例的问题 (#2798)
+* [33ma164c965[m 修复历史会话原生恢复时缺少供应商配置 (#2779)

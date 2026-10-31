@@ -1,0 +1,421 @@
+name: Test build release
+
+"on":
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "构建分支、标签或提交"
+        default: main
+        required: true
+        type: string
+      build_date:
+        description: "测试构建日期，可留空使用北京时间；格式 YYYYMMDD 或 YYYY-MM-DD"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: test-build-release-${{ inputs.ref }}-${{ inputs.build_date }}
+  cancel-in-progress: false
+
+env:
+  TEST_VERSION: ""
+
+jobs:
+  version:
+    name: Resolve test version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        env:
+          REQUESTED_DATE: ${{ inputs.build_date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          stable="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          date="${REQUESTED_DATE:-$(TZ=Asia/Shanghai date +%Y%m%d)}"
+          versions="$(node scripts/ci/test-build-version.mjs resolve "$stable" "$date")"
+          version="$(node -p 'JSON.parse(process.argv[1]).version' "$versions")"
+          tag="$(node -p 'JSON.parse(process.argv[1]).tag' "$versions")"
+          sha="$(git rev-parse HEAD)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 测试版本"
+            echo
+            echo "- 应用版本：\`$version\`"
+            echo "- Release：\`$tag\`"
+            echo "- 源码提交：\`$sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  windows:
+    name: Windows artifacts
+    needs: version
+    runs-on: windows-latest
+    env:
+      TEST_VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/codex-plus-manager/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          $makensis = $null
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install nsis -y --no-progress
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+              "$env:ProgramFiles\NSIS\makensis.exe"
+            )
+            $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+            if (-not $makensis) {
+              $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
+              if ($command) { $makensis = $command.Source }
+            }
+            if ($makensis) {
+              & $makensis /VERSION
+              if ($LASTEXITCODE -eq 0) { break }
+            }
+            $makensis = $null
+            if ($attempt -lt 3) { Start-Sleep -Seconds (10 * $attempt) }
+          }
+          if (-not $makensis) { throw "NSIS 安装失败或编译器不可用。" }
+
+      - name: Install frontend dependencies
+        working-directory: apps/codex-plus-manager
+        run: npm ci
+
+      - name: Frontend tests
+        working-directory: apps/codex-plus-manager
+        run: npm test
+
+      - name: TypeScript check
+        working-directory: apps/codex-plus-manager
+        run: npm run check
+
+      - name: Build frontend
+        working-directory: apps/codex-plus-manager
+        run: npm run vite:build
+
+      - name: Rust tests
+        env:
+          CARGO_TARGET_DIR: target/ci-tests
+        run: cargo test --workspace
+
+      - name: Set test version
+        shell: bash
+        run: node scripts/ci/test-build-version.mjs apply "$TEST_VERSION"
+
+      - name: Verify test version
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F "\"version\": \"$TEST_VERSION\"" apps/codex-plus-manager/package.json
+          grep -F "\"version\": \"$TEST_VERSION\"" apps/codex-plus-manager/src-tauri/tauri.conf.json
+          grep -F "version = \"$TEST_VERSION\"" Cargo.toml
+          grep -F "version = \"$TEST_VERSION\"" Cargo.lock
+          grep -F "version: workspace" apps/codex-plus-manager/src-tauri/Cargo.toml
+
+      - name: Build application
+        run: cargo build --release
+
+      - name: Stage Windows app files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/windows/app | Out-Null
+          Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
+          if ((Get-ChildItem dist/windows/app -Filter *.exe).Count -ne 1) { throw "Windows 应用目录必须只有一个程序。" }
+          $version = (Get-Item dist/windows/app/codex-plus-plus.exe).VersionInfo
+          if ($version.ProductVersion -notlike "$env:TEST_VERSION*") {
+            throw "Windows 程序版本不正确：$($version.ProductVersion)"
+          }
+
+      - name: Build Windows assets
+        shell: pwsh
+        run: |
+          $version = $env:TEST_VERSION
+          Compress-Archive -Path dist/windows/app/* -DestinationPath "dist/windows/CodexPlusPlus-$version-windows-x64.zip" -Force
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+            "$env:ProgramFiles\NSIS\makensis.exe"
+          )
+          $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $makensis) {
+            $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
+            if ($command) { $makensis = $command.Source }
+          }
+          if (-not $makensis) { throw "NSIS 编译器未找到。" }
+          Push-Location scripts/installer/windows
+          try {
+            & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" CodexPlusPlus.nsi
+            if ($LASTEXITCODE -ne 0) { throw "NSIS 打包失败，退出码 $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+          $expected = @(
+            "CodexPlusPlus-$version-windows-x64.zip",
+            "CodexPlusPlus-$version-windows-x64-setup.exe"
+          )
+          foreach ($name in $expected) {
+            $item = Get-Item -LiteralPath "dist/windows/$name" -ErrorAction Stop
+            if ($item.Length -le 0) { throw "Windows 产物为空：$name" }
+          }
+          if ((Get-ChildItem dist/windows -File).Count -ne 2) {
+            throw "Windows 产物应恰好为 zip 和 setup.exe。"
+          }
+
+      - name: Upload Windows assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-build-windows
+          path: |
+            dist/windows/*.zip
+            dist/windows/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: macOS universal DMG
+    needs: version
+    runs-on: macos-14
+    env:
+      TEST_VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/codex-plus-manager/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Install frontend dependencies
+        working-directory: apps/codex-plus-manager
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: apps/codex-plus-manager
+        run: npm run vite:build
+
+      - name: Set test version
+        shell: bash
+        run: node scripts/ci/test-build-version.mjs apply "$TEST_VERSION"
+
+      - name: Verify test version
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F "\"version\": \"$TEST_VERSION\"" apps/codex-plus-manager/package.json
+          grep -F "\"version\": \"$TEST_VERSION\"" apps/codex-plus-manager/src-tauri/tauri.conf.json
+          grep -F "version = \"$TEST_VERSION\"" Cargo.toml
+          grep -F "version = \"$TEST_VERSION\"" Cargo.lock
+          grep -F "version: workspace" apps/codex-plus-manager/src-tauri/Cargo.toml
+
+      - name: Build universal macOS DMG
+        env:
+          MACOS_SIGNING_IDENTITY: ""
+          MACOS_NOTARY_PROFILE: ""
+        run: |
+          set -euo pipefail
+          bash scripts/installer/macos/build-universal.sh "$TEST_VERSION"
+
+      - name: Verify macOS bundle
+        run: |
+          set -euo pipefail
+          test -L "dist/macos/stage/Applications"
+          test "$(readlink "dist/macos/stage/Applications")" = "/Applications"
+          apps=(dist/macos/stage/*.app)
+          test "${#apps[@]}" = "2"
+          for app in "${apps[@]}"; do
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$TEST_VERSION"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")" = "$TEST_VERSION"
+            plutil -lint "$app/Contents/Info.plist" >/dev/null
+            codesign --verify --deep --strict "$app"
+            echo "verified: $app"
+          done
+          dmg="dist/macos/CodexPlusPlus-$TEST_VERSION-macos-universal.dmg"
+          test -s "$dmg"
+          test "$(find dist/macos -maxdepth 1 -name '*.dmg' | wc -l | tr -d ' ')" = "1"
+          file "$dmg"
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-build-macos
+          path: dist/macos/*.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish test Release
+    needs:
+      - version
+      - windows
+      - macos
+    runs-on: ubuntu-latest
+    env:
+      TEST_VERSION: ${{ needs.version.outputs.version }}
+      TEST_TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: test-build-*
+          merge-multiple: true
+
+      - name: Verify and checksum assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            "CodexPlusPlus-$TEST_VERSION-macos-universal.dmg"
+            "CodexPlusPlus-$TEST_VERSION-windows-x64-setup.exe"
+            "CodexPlusPlus-$TEST_VERSION-windows-x64.zip"
+          )
+          for name in "${required[@]}"; do
+            test -s "dist/$name"
+          done
+          test "$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')" = "3"
+          (
+            cd dist
+            sha256sum "${required[@]}" > SHA256SUMS.txt
+          )
+          cat dist/SHA256SUMS.txt
+
+      - name: Create prerelease
+        id: release
+        uses: actions/github-script@v7
+        env:
+          SOURCE_SHA: ${{ needs.version.outputs.sha }}
+        with:
+          script: |
+            const fs = require("fs");
+            const version = process.env.TEST_VERSION;
+            const tag = process.env.TEST_TAG;
+            const notes = fs.readFileSync("dist/SHA256SUMS.txt", "utf8");
+            const create = await github.rest.repos.createRelease({
+              ...context.repo,
+              tag_name: tag,
+              target_commitish: process.env.SOURCE_SHA,
+              name: `Codex++ ${version}`,
+              body: [
+                `基于 \`v${version}\` 的测试构建，不进入稳定版自动更新通道。`,
+                "",
+                `- 测试版本：\`${version}\``,
+                `- 源码提交：\`${process.env.SOURCE_SHA}\``,
+                `- 工作流运行：${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                "",
+                "macOS 测试包使用 ad-hoc 签名，未做 Apple 公证；首次打开可能需要在 Finder 中右键选择“打开”。",
+                "",
+                "Windows 包未使用代码签名证书，SmartScreen 可能显示未知发布者。",
+                "",
+                "### 校验",
+                "",
+                "```",
+                notes.trimEnd(),
+                "```"
+              ].join("\n"),
+              prerelease: true,
+            });
+            core.setOutput("id", String(create.data.id));
+            core.setOutput("upload-url", create.data.upload_url);
+
+      - name: Upload release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPLOAD_URL: ${{ steps.release.outputs.upload-url }}
+        run: |
+          set -euo pipefail
+          endpoint="${UPLOAD_URL%\{*}"
+          assets=(
+            "CodexPlusPlus-$TEST_VERSION-macos-universal.dmg"
+            "CodexPlusPlus-$TEST_VERSION-windows-x64-setup.exe"
+            "CodexPlusPlus-$TEST_VERSION-windows-x64.zip"
+          )
+          for name in "${assets[@]}"; do
+            curl --fail-with-body --silent --show-error \
+              --retry 3 --retry-all-errors \
+              -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@dist/$name" \
+              "$endpoint?name=$(node -p 'encodeURIComponent(process.argv[1])' "$name")" > upload.json
+            node -e '
+              const fs = require("fs");
+              const result = JSON.parse(fs.readFileSync("upload.json", "utf8"));
+              if (result.name !== process.argv[1] || !(result.size > 0)) {
+                throw new Error("Release 附件上传失败：" + process.argv[1]);
+              }
+            ' "$name"
+          done
+
+      - name: Verify published assets
+        uses: actions/github-script@v7
+        env:
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+        with:
+          script: |
+            const release = await github.rest.repos.getRelease({
+              ...context.repo,
+              release_id: Number(process.env.RELEASE_ID),
+            });
+            if (!release.data.prerelease) throw new Error("测试 Release 必须标记为 prerelease");
+            const version = process.env.TEST_VERSION;
+            const expected = [
+              `CodexPlusPlus-${version}-macos-universal.dmg`,
+              `CodexPlusPlus-${version}-windows-x64-setup.exe`,
+              `CodexPlusPlus-${version}-windows-x64.zip`,
+            ].sort();
+            const actual = (release.data.assets || [])
+              .filter((asset) => asset.state === "uploaded" && asset.size > 0)
+              .map((asset) => asset.name)
+              .sort();
+            if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+              throw new Error("Release 附件不正确：" + JSON.stringify(actual));
+            }
+            core.info(`verified: ${release.data.tag_name}: ${actual.join(", ")}`);
+
+      - name: Add release link to summary
+        shell: bash
+        run: |
+          echo "### 测试构建已发布" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/${{ github.repository }}/releases/tag/$TEST_TAG" >> "$GITHUB_STEP_SUMMARY"
